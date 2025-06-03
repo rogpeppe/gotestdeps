@@ -1,8 +1,7 @@
 // Command gomodviz prints a GraphViz “dot” graph of the current module’s
 // dependencies, colouring modules required only by tests in red.
 //
-//	go run . > deps.dot
-//	dot -Tpng deps.dot -o deps.png
+//	go run . > deps.mmd
 //
 // Requires: go1.22+ and golang.org/x/tools/go/packages.
 package main
@@ -15,8 +14,15 @@ import (
 	"log"
 	"os"
 	"sort"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
+)
+
+const (
+	testColor    = "#ffdddd"
+	nonTestColor = "#ececff"
+	mainColor    = "#ddffdd"
 )
 
 func main() {
@@ -30,8 +36,8 @@ in red the modules that are present only because of tests.
 	flag.Parse()
 
 	// 1. Load the module universe twice: with and without test files.
-	noTestMods := loadModuleSet(false, "all")
-	testPkgs, withTestMods := loadPkgsAndModuleSet(true, "all")
+	mainMod, _, noTestMods := loadModuleSet(false, "all")
+	_, testPkgs, withTestMods := loadModuleSet(true, "all")
 
 	// 2. Any module present only in the second load is “test-only”.
 	testOnly := difference(withTestMods, noTestMods)
@@ -45,15 +51,10 @@ in red the modules that are present only because of tests.
 	}
 
 	// 4. Emit GraphViz.
-	writeDot(os.Stdout, edges, nodes, testOnly)
+	writeDot(os.Stdout, mainMod, edges, nodes, testOnly)
 }
 
-func loadModuleSet(includeTests bool, pattern string) map[string]struct{} {
-	_, mods := loadPkgsAndModuleSet(includeTests, pattern)
-	return mods
-}
-
-func loadPkgsAndModuleSet(includeTests bool, pattern string) ([]*packages.Package, map[string]struct{}) {
+func loadModuleSet(includeTests bool, pattern string) (string, []*packages.Package, map[string]struct{}) {
 	cfg := &packages.Config{
 		Mode:  packages.NeedImports | packages.NeedModule | packages.NeedDeps,
 		Tests: includeTests,
@@ -67,12 +68,16 @@ func loadPkgsAndModuleSet(includeTests bool, pattern string) ([]*packages.Packag
 	}
 
 	mods := make(map[string]struct{})
+	mainMod := ""
 	traverse(pkgs, func(p *packages.Package) {
 		if p.Module != nil {
 			mods[p.Module.Path] = struct{}{}
+			if p.Module.Main {
+				mainMod = p.Module.Path
+			}
 		}
 	})
-	return pkgs, mods
+	return mainMod, pkgs, mods
 }
 
 // traverse walks the import graph once, visiting every package exactly once.
@@ -128,9 +133,10 @@ func modulePathOf(p *packages.Package) string {
 	return ""
 }
 
-func writeDot(out io.Writer, edges map[string]map[string]struct{},
+func writeDot(out io.Writer, mainMod string, edges map[string]map[string]struct{},
 	nodes, testOnly map[string]struct{}) {
 
+	fmt.Fprintf(out, "```mermaid\n")
 	fmt.Fprintf(out, "graph LR\n")
 	//	fmt.Fprint(out, `
 	//digraph G {
@@ -172,21 +178,31 @@ func writeDot(out io.Writer, edges map[string]map[string]struct{},
 			fmt.Fprintf(out, "    N%d --> N%d\n", indexes[f], indexes[t])
 		}
 	}
-	fmt.Fprintf(out, "    classDef red fill:#ffdddd,stroke:#333,stroke-width:1px;\n")
-	if len(testOnly) > 0 {
-		fmt.Fprintf(out, "    class ")
-		printed := false
+	nodeColor := func(className, color string, choose func(name string) bool) {
+		var selected []string
 		for i, name := range allNodes {
-			if _, ok := testOnly[name]; ok {
-				if printed {
-					fmt.Fprintf(out, ",")
-				}
-				fmt.Fprintf(out, "N%d", i)
-				printed = true
+			if choose(name) {
+				selected = append(selected, fmt.Sprintf("N%d", i))
 			}
 		}
-		fmt.Fprintf(out, " red;\n")
+		if len(selected) == 0 {
+			return
+		}
+		fmt.Fprintf(out, "    classDef %s fill:%s,stroke:#333,stroke-width:1px;\n", className, color)
+		fmt.Fprintf(out, "    class %s %s;\n", strings.Join(selected, ","), className)
 	}
+	nodeColor("mainModule", mainColor, func(name string) bool {
+		return name == mainMod
+	})
+	nodeColor("testOnlyDep", testColor, func(name string) bool {
+		_, isTestOnly := testOnly[name]
+		return isTestOnly && name != mainMod
+	})
+	nodeColor("regularDep", nonTestColor, func(name string) bool {
+		_, isTestOnly := testOnly[name]
+		return !isTestOnly && name != mainMod
+	})
+	fmt.Fprintf(out, "```\n")
 }
 
 func difference(a, b map[string]struct{}) map[string]struct{} {
